@@ -13,5 +13,5 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(pybind11)
 
-pybind11_add_module(test MODULE tests/test1.cpp)
+
 pybind11_add_module(QuantLib MODULE src/main.cpp)
