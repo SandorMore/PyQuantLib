@@ -6,10 +6,39 @@
 #include <exception>
 #include <memory>
 #include <new>
+#include <bitset>
 
-class Parser final
+int parseCSV(const char*)
+{
+    return 0;
+}
+
+int parseJSON(const char*)
+{
+    return 0;
+}
+
+class WSParser final
 {  
 public:
+
+private:
+    
+};
+
+class FileParser final 
+{
+public:
+
+private:
+
+};
+
+
+class TCPParser final 
+{
+public:
+
 
 private:
 
