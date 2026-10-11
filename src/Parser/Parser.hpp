@@ -8,38 +8,6 @@
 #include <new>
 #include <bitset>
 
-int parseCSV(const char*)
-{
-    return 0;
-}
+int parseCSV(const char*);
 
-int parseJSON(const char*)
-{
-    return 0;
-}
-
-class WSParser final
-{  
-public:
-
-private:
-    
-};
-
-class FileParser final 
-{
-public:
-
-private:
-
-};
-
-
-class TCPParser final 
-{
-public:
-
-
-private:
-
-};
+int parseJSON(const char*);
