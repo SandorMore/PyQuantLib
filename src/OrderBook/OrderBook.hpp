@@ -8,7 +8,6 @@
 #include <utility>
 #include <type_traits>
 
-template <typename T>
 class OrderBook final
 {
 public:
