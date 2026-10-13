@@ -7,13 +7,13 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(QuantLib, module)
 {
-    using IntQueue = SPSCQueue<int>;
+    using ISPSCQueue = SPSCQueue<int>;
 
-    py::class_<IntQueue>(module, "SPSCQueue")
+    py::class_<ISPSCQueue>(module, "SPSCQueue")
         .def(py::init<std::size_t>(), py::arg("capacity"))
-        .def("try_push", [](IntQueue& queue, int value) {
+        .def("try_push", [](ISPSCQueue& queue, int value) {
             return queue.try_emplace(value);
         }, py::arg("value"), py::call_guard<py::gil_scoped_release>())
-        .def("try_pop", &IntQueue::try_pop,
+        .def("try_pop", &ISPSCQueue::try_pop,
              py::call_guard<py::gil_scoped_release>());
 }

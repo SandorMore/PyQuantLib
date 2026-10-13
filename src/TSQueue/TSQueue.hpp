@@ -10,7 +10,7 @@ public:
     TSQueue();
     TSQueue(const TSQueue&);
 
-    void push(T new_val);
+    void push(T);
     void wait_and_pop();
 private:
     mutable std::mutex mut;
