@@ -2,18 +2,28 @@
 #include <pybind11/stl.h>
 
 #include "SPSCQueue/SPSCQueue.hpp"
+#include "TSQueue/TSQueue.hpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(QuantLib, module)
 {
     using ISPSCQueue = SPSCQueue<int>;
+    using DSPSCQueue = SPSCQueue<double>;
 
-    py::class_<ISPSCQueue>(module, "SPSCQueue")
+    py::class_<ISPSCQueue>(module, "ISPSCQueue")
         .def(py::init<std::size_t>(), py::arg("capacity"))
         .def("try_push", [](ISPSCQueue& queue, int value) {
             return queue.try_emplace(value);
         }, py::arg("value"), py::call_guard<py::gil_scoped_release>())
         .def("try_pop", &ISPSCQueue::try_pop,
              py::call_guard<py::gil_scoped_release>());
+
+    py::class_<DSPSCQueue>(module, "DSPSCQueue")
+        .def(py::init<std::size_t>(), py::arg("capacity"))
+        .def("try_push", [](DSPSCQueue& queue, double value){
+            return queue.try_emplace(value);
+        }, py::call_guard<py::gil_scoped_release>())
+        .def("try_pop", &DSPSCQueue::try_pop,
+            py::call_guard<py::gil_scoped_release>());
 }
