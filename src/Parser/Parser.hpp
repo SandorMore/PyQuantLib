@@ -99,3 +99,14 @@ inline const char* to_string(DIA d) {
 inline DIA active_arch();
 
 void init();
+
+namespace avx2
+{
+    struct State 
+    {
+        uint64_t prev_escaped;
+        uint64_t prev_in_string;
+        uint64_t prev_scalar;
+    };    
+
+} // namespace avx2
