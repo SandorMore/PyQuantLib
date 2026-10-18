@@ -11,18 +11,44 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '4.1.x'
+
+      - name: Set up vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+          -DPython_EXECUTABLE=$(which python)
 
       - name: Build
         run: cmake --build build --parallel
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          pip install pytest
+          PYTHONPATH=build pytest tests/
 
   promote:
     needs: build-and-test         
