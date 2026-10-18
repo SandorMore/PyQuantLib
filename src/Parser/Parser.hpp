@@ -1,6 +1,5 @@
 #pragma once
 
-#include <immintrin.h>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -122,93 +121,91 @@ enum class JsonType {
 class JsonValue;
 class JsonDocument;
 
-// JSON Value - variant type holding different JSON types
+// JSON Value - compact tagged union (40 bytes). The variant index order must
+// match JsonType so type() is a plain cast.
 class JsonValue {
 public:
     using Object = std::unordered_map<std::string, JsonValue>;
     using Array = std::vector<JsonValue>;
 
-    JsonValue() : type_(JsonType::Null) {}
-    JsonValue(std::nullptr_t) : type_(JsonType::Null) {}
-    JsonValue(bool b) : type_(JsonType::Bool), bool_val_(b) {}
-    JsonValue(double n) : type_(JsonType::Number), number_val_(n) {}
-    JsonValue(std::string s) : type_(JsonType::String), string_val_(std::move(s)) {}
-    JsonValue(Array a) : type_(JsonType::Array), array_val_(std::make_shared<Array>(std::move(a))) {}
-    JsonValue(Object o) : type_(JsonType::Object), object_val_(std::make_shared<Object>(std::move(o))) {}
+    JsonValue() = default;
+    JsonValue(std::nullptr_t) {}
+    JsonValue(bool b) : data_(b) {}
+    JsonValue(double n) : data_(n) {}
+    JsonValue(std::string s) : data_(std::move(s)) {}
+    JsonValue(Array a) : data_(std::make_shared<Array>(std::move(a))) {}
+    JsonValue(Object o) : data_(std::make_shared<Object>(std::move(o))) {}
 
-    JsonType type() const { return type_; }
+    JsonType type() const { return static_cast<JsonType>(data_.index()); }
 
-    bool is_null() const { return type_ == JsonType::Null; }
-    bool is_bool() const { return type_ == JsonType::Bool; }
-    bool is_number() const { return type_ == JsonType::Number; }
-    bool is_string() const { return type_ == JsonType::String; }
-    bool is_array() const { return type_ == JsonType::Array; }
-    bool is_object() const { return type_ == JsonType::Object; }
+    bool is_null() const { return type() == JsonType::Null; }
+    bool is_bool() const { return type() == JsonType::Bool; }
+    bool is_number() const { return type() == JsonType::Number; }
+    bool is_string() const { return type() == JsonType::String; }
+    bool is_array() const { return type() == JsonType::Array; }
+    bool is_object() const { return type() == JsonType::Object; }
 
     bool as_bool() const {
         if (!is_bool()) throw std::runtime_error("Not a boolean");
-        return bool_val_;
+        return std::get<bool>(data_);
     }
 
     double as_number() const {
         if (!is_number()) throw std::runtime_error("Not a number");
-        return number_val_;
+        return std::get<double>(data_);
     }
 
     const std::string& as_string() const {
         if (!is_string()) throw std::runtime_error("Not a string");
-        return string_val_;
+        return std::get<std::string>(data_);
     }
 
     const Array& as_array() const {
         if (!is_array()) throw std::runtime_error("Not an array");
-        return *array_val_;
+        return *std::get<std::shared_ptr<Array>>(data_);
     }
 
     const Object& as_object() const {
         if (!is_object()) throw std::runtime_error("Not an object");
-        return *object_val_;
+        return *std::get<std::shared_ptr<Object>>(data_);
     }
 
     // Array/Object access
     JsonValue& operator[](size_t index) {
         if (!is_array()) throw std::runtime_error("Not an array");
-        return (*array_val_)[index];
+        return (*std::get<std::shared_ptr<Array>>(data_))[index];
     }
 
     JsonValue& operator[](const std::string& key) {
         if (!is_object()) throw std::runtime_error("Not an object");
-        return (*object_val_)[key];
+        return (*std::get<std::shared_ptr<Object>>(data_))[key];
     }
 
 private:
-    JsonType type_;
-    bool bool_val_ = false;
-    double number_val_ = 0.0;
-    std::string string_val_;
-    std::shared_ptr<Array> array_val_;
-    std::shared_ptr<Object> object_val_;
+    std::variant<std::nullptr_t, bool, double, std::string,
+                 std::shared_ptr<Array>, std::shared_ptr<Object>> data_;
 };
 
-// SIMD scanning state for AVX2
-namespace avx2
+// SIMD structural indexing (stage 1): the offset of every structural character
+// ({}[],:), every opening quote and the first byte of every other scalar, outside
+// strings. Uses AVX2 when the CPU supports it, a scalar kernel otherwise.
+namespace json_detail
 {
-    struct State
-    {
-        uint64_t prev_escaped = 0;
-        uint64_t prev_in_string = 0;
-        uint64_t prev_scalar = 0;
+    struct IndexView {
+        const uint32_t* data;
+        size_t size;
     };
 
-    // Find structural characters using AVX2
-    inline void find_structural_bits(const uint8_t* data, size_t len,
-                                     uint64_t& structural_chars,
-                                     State& state);
+    // Indexes `json` into a thread-local buffer. The view stays valid until the
+    // next call on this thread or release_index_buffer().
+    IndexView index_document(std::string_view json);
 
-    // Classify characters for JSON parsing
-    inline __m256i classify_chars(const __m256i input);
+    // Frees the thread-local buffer if a large document made it grow.
+    void release_index_buffer();
 
-} // namespace avx2
+    // Copying variant for tests and benchmarks; `use_simd = false` forces the scalar kernel.
+    void find_structural_indexes(std::string_view json, std::vector<uint32_t>& out, bool use_simd);
+} // namespace json_detail
 
 // JSON Parser Exception
 class JsonParseError : public std::runtime_error {
@@ -241,32 +238,4 @@ public:
 private:
     JsonValue root_;
     bool explicit_null_ = false;
-
-    // Parser state
-    struct Parser {
-        std::string_view json;
-        size_t pos = 0;
-
-        Parser(std::string_view j) : json(j) {}
-
-        // Skip whitespace
-        void skip_whitespace();
-
-        // Parse value (entry point)
-        JsonValue parse_value();
-
-        // Parse specific types
-        JsonValue parse_null();
-        JsonValue parse_bool();
-        JsonValue parse_number();
-        JsonValue parse_string();
-        JsonValue parse_array();
-        JsonValue parse_object();
-
-        // Helpers
-        char peek() const { return pos < json.size() ? json[pos] : '\0'; }
-        char advance() { return pos < json.size() ? json[pos++] : '\0'; }
-        void expect(char c);
-        bool match(std::string_view str);
-    };
 };

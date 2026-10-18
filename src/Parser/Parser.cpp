@@ -1,9 +1,23 @@
 #include "Parser.hpp"
+#include "JsonTape.hpp"
 #include <iostream>
 #include <cstring>
 #include <cstddef>
-#include <cctype>
 #include <algorithm>
+#include <bit>
+#include <limits>
+
+#if defined(__x86_64__) || defined(_M_X64)
+  #include <immintrin.h>
+  #define PQL_X86_64 1
+  #if defined(__GNUC__) || defined(__clang__)
+    // Lets the AVX2 kernel exist without building the whole module with -mavx2;
+    // it is only called after runtime detection says the CPU supports it.
+    #define PQL_TARGET_AVX2 __attribute__((target("avx2,pclmul")))
+  #else
+    #define PQL_TARGET_AVX2
+  #endif
+#endif
 
 DIA active_arch()
 {
@@ -36,420 +50,307 @@ void init()
 }
 
 // ============================================================================
-// AVX2 SIMD Implementation
+// Stage 1: structural indexing (simdjson-style)
+//
+// The input is processed in 64-byte blocks. Each block is classified into
+// bitmasks (one bit per byte), string regions are resolved with a prefix XOR
+// over the unescaped quotes, and the positions of everything stage 2 needs to
+// look at are written to an index array.
 // ============================================================================
 
-namespace avx2 {
+namespace {
 
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+constexpr size_t BLOCK = 64;
+constexpr uint64_t ODD_BITS = 0xAAAAAAAAAAAAAAAAULL;
 
-// Classify 32 bytes at once for JSON structural characters
-inline __m256i classify_chars(const __m256i input) {
-    // Detect structural characters: {}[],:
-    const __m256i left_brace   = _mm256_set1_epi8('{');
-    const __m256i right_brace  = _mm256_set1_epi8('}');
-    const __m256i left_bracket = _mm256_set1_epi8('[');
-    const __m256i right_bracket= _mm256_set1_epi8(']');
-    const __m256i colon        = _mm256_set1_epi8(':');
-    const __m256i comma        = _mm256_set1_epi8(',');
+struct BlockMasks {
+    uint64_t op;        // { } [ ] , :
+    uint64_t ws;        // space \t \n \r
+    uint64_t quote;     // "
+    uint64_t backslash; // '\'
+};
 
-    __m256i structural = _mm256_cmpeq_epi8(input, left_brace);
-    structural = _mm256_or_si256(structural, _mm256_cmpeq_epi8(input, right_brace));
-    structural = _mm256_or_si256(structural, _mm256_cmpeq_epi8(input, left_bracket));
-    structural = _mm256_or_si256(structural, _mm256_cmpeq_epi8(input, right_bracket));
-    structural = _mm256_or_si256(structural, _mm256_cmpeq_epi8(input, colon));
-    structural = _mm256_or_si256(structural, _mm256_cmpeq_epi8(input, comma));
+struct Stage1State {
+    uint64_t next_is_escaped = 0; // last byte of previous block was an escaping backslash
+    uint64_t prev_in_string = 0;  // all ones if the previous block ended inside a string
+    uint64_t prev_scalar = 0;     // last byte of previous block was a non-quote scalar byte
+};
 
-    return structural;
-}
-
-// Detect whitespace characters
-inline __m256i detect_whitespace(const __m256i input) {
-    const __m256i space  = _mm256_set1_epi8(' ');
-    const __m256i tab    = _mm256_set1_epi8('\t');
-    const __m256i newline= _mm256_set1_epi8('\n');
-    const __m256i cr     = _mm256_set1_epi8('\r');
-
-    __m256i ws = _mm256_cmpeq_epi8(input, space);
-    ws = _mm256_or_si256(ws, _mm256_cmpeq_epi8(input, tab));
-    ws = _mm256_or_si256(ws, _mm256_cmpeq_epi8(input, newline));
-    ws = _mm256_or_si256(ws, _mm256_cmpeq_epi8(input, cr));
-
-    return ws;
-}
-
-// Detect quote characters
-inline __m256i detect_quotes(const __m256i input) {
-    const __m256i quote = _mm256_set1_epi8('"');
-    return _mm256_cmpeq_epi8(input, quote);
-}
-
-// Detect backslash (escape character)
-inline __m256i detect_backslash(const __m256i input) {
-    const __m256i backslash = _mm256_set1_epi8('\\');
-    return _mm256_cmpeq_epi8(input, backslash);
-}
-
-// Calculate escaped characters using prefix XOR technique (simdjson-style)
-inline uint64_t compute_escaped(uint64_t backslashes, uint64_t& prev_escaped) {
-    // Find escaped characters by tracking odd runs of backslashes
-    uint64_t starts_with_escape = backslashes & ~(backslashes << 1);
-    uint64_t even_starts = starts_with_escape & 0xAAAAAAAAAAAAAAAAULL;
-    uint64_t odd_starts = starts_with_escape & ~even_starts;
-
-    uint64_t even_carries = backslashes + even_starts;
-    uint64_t odd_carries = backslashes + odd_starts;
-
-    uint64_t even_escaped = even_carries ^ backslashes;
-    uint64_t odd_escaped = odd_carries ^ backslashes;
-
-    uint64_t escaped = odd_escaped & ~even_escaped;
-
-    // Handle escape from previous block
-    if (prev_escaped) {
-        escaped ^= 1ULL;
+// Bits of characters escaped by a backslash. Runs of backslashes alternate
+// escape/escaped, so only odd-length runs escape the following character.
+inline uint64_t escaped_bits(uint64_t backslash, Stage1State& s) {
+    if (!backslash) {
+        uint64_t escaped = s.next_is_escaped;
+        s.next_is_escaped = 0;
+        return escaped;
     }
-
-    prev_escaped = (backslashes >> 63) & 1;
+    uint64_t potential_escape = backslash & ~s.next_is_escaped;
+    uint64_t maybe_escaped = potential_escape << 1;
+    uint64_t escape_and_terminal_code = ((maybe_escaped | ODD_BITS) - potential_escape) ^ ODD_BITS;
+    uint64_t escaped = escape_and_terminal_code ^ (backslash | s.next_is_escaped);
+    uint64_t escape = escape_and_terminal_code & backslash;
+    s.next_is_escaped = escape >> 63;
     return escaped;
 }
 
-// Find strings using quote tracking
-inline uint64_t find_strings(uint64_t quotes, uint64_t escaped, uint64_t& prev_in_string) {
-    // Remove escaped quotes
-    uint64_t unescaped_quotes = quotes & ~escaped;
-
-    // Toggle string state at each unescaped quote using prefix XOR
-    uint64_t string_mask = unescaped_quotes ^ prev_in_string;
-
-    // Propagate the string state
-    uint64_t in_string = string_mask;
-    in_string ^= in_string << 1;
-    in_string ^= in_string << 2;
-    in_string ^= in_string << 4;
-    in_string ^= in_string << 8;
-    in_string ^= in_string << 16;
-    in_string ^= in_string << 32;
-
-    prev_in_string = in_string >> 63;
-    return in_string;
+inline uint64_t prefix_xor_scalar(uint64_t x) {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    return x;
 }
 
-void find_structural_bits(const uint8_t* data, size_t len,
-                          uint64_t& structural_chars,
-                          State& state) {
-    structural_chars = 0;
+// Combines the classified masks into the structural bitmap of one block.
+// `in_string` covers the opening quote and string contents, not the closing quote.
+inline uint64_t structural_bits(const BlockMasks& m, uint64_t quote, uint64_t in_string, Stage1State& s) {
+    uint64_t scalar = ~(m.op | m.ws);
+    uint64_t nonquote_scalar = scalar & ~quote;
+    uint64_t follows_nonquote_scalar = (nonquote_scalar << 1) | s.prev_scalar;
+    s.prev_scalar = nonquote_scalar >> 63;
+    uint64_t scalar_start = scalar & ~follows_nonquote_scalar;
+    uint64_t string_tail = in_string ^ quote;
+    return (m.op | scalar_start) & ~string_tail;
+}
 
-    if (len < 32) {
-        // Fall back to scalar processing for small buffers
-        return;
+inline uint32_t* flatten_bits(uint32_t* out, uint32_t base, uint64_t bits) {
+    if (!bits) return out;
+    const int count = std::popcount(bits);
+    // Unconditional writes keep the common case branch-free; the buffer has slack.
+    for (int i = 0; i < 8; ++i) {
+        out[i] = base + static_cast<uint32_t>(std::countr_zero(bits));
+        bits &= bits - 1;
     }
-
-    // Process 32 bytes at a time
-    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
-
-    // Detect structural characters, quotes, backslashes, whitespace
-    __m256i structural = classify_chars(chunk);
-    __m256i quotes_vec = detect_quotes(chunk);
-    __m256i backslash_vec = detect_backslash(chunk);
-    __m256i ws_vec = detect_whitespace(chunk);
-
-    // Convert to bitmasks
-    uint32_t structural_mask = _mm256_movemask_epi8(structural);
-    uint32_t quotes_mask = _mm256_movemask_epi8(quotes_vec);
-    uint32_t backslash_mask = _mm256_movemask_epi8(backslash_vec);
-    uint32_t ws_mask = _mm256_movemask_epi8(ws_vec);
-
-    // Calculate escaped characters
-    uint64_t escaped = compute_escaped(backslash_mask, state.prev_escaped);
-
-    // Find string regions
-    uint64_t in_string = find_strings(quotes_mask, escaped, state.prev_in_string);
-
-    // Structural characters are only valid outside strings and non-whitespace
-    structural_chars = structural_mask & ~in_string & ~ws_mask;
+    if (count > 8) {
+        for (int i = 8; i < 16; ++i) {
+            out[i] = base + static_cast<uint32_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+        }
+        for (int i = 16; bits; ++i) {
+            out[i] = base + static_cast<uint32_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+        }
+    }
+    return out + count;
 }
 
-#else
-
-// Scalar fallback
-inline __m256i classify_chars(const __m256i input) {
-    return _mm256_setzero_si256();
+inline BlockMasks classify_scalar(const uint8_t* p) {
+    BlockMasks m{0, 0, 0, 0};
+    for (size_t i = 0; i < BLOCK; ++i) {
+        const uint64_t bit = 1ULL << i;
+        switch (p[i]) {
+            case '{': case '}': case '[': case ']': case ',': case ':': m.op |= bit; break;
+            case ' ': case '\t': case '\n': case '\r': m.ws |= bit; break;
+            case '"': m.quote |= bit; break;
+            case '\\': m.backslash |= bit; break;
+            default: break;
+        }
+    }
+    return m;
 }
 
-void find_structural_bits(const uint8_t* data, size_t len,
-                          uint64_t& structural_chars,
-                          State& state) {
-    structural_chars = 0;
+inline uint32_t* process_block_scalar(const uint8_t* p, uint32_t base, uint32_t* out, Stage1State& s) {
+    const BlockMasks m = classify_scalar(p);
+    const uint64_t quote = m.quote & ~escaped_bits(m.backslash, s);
+    const uint64_t in_string = prefix_xor_scalar(quote) ^ s.prev_in_string;
+    s.prev_in_string = static_cast<uint64_t>(static_cast<int64_t>(in_string) >> 63);
+    return flatten_bits(out, base, structural_bits(m, quote, in_string, s));
+}
+
+#if defined(PQL_X86_64)
+
+PQL_TARGET_AVX2 inline uint64_t movemask64(__m256i lo, __m256i hi) {
+    return static_cast<uint32_t>(_mm256_movemask_epi8(lo)) |
+           (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(hi))) << 32);
+}
+
+PQL_TARGET_AVX2 inline BlockMasks classify_avx2(const uint8_t* p) {
+    // Nibble lookup tables: a byte is whitespace iff table[low nibble] == byte,
+    // and an operator iff table[low nibble] == (byte | 0x20), which folds [ ] onto { }.
+    // Bytes >= 0x80 shuffle to 0 and never match.
+    const __m256i ws_table = _mm256_setr_epi8(
+        ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r', 100, 100,
+        ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r', 100, 100);
+    const __m256i op_table = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', '{', ',', '}', 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', '{', ',', '}', 0, 0);
+    const __m256i lower = _mm256_set1_epi8(0x20);
+    const __m256i quote = _mm256_set1_epi8('"');
+    const __m256i backslash = _mm256_set1_epi8('\\');
+
+    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+
+    BlockMasks m;
+    m.ws = movemask64(_mm256_cmpeq_epi8(lo, _mm256_shuffle_epi8(ws_table, lo)),
+                      _mm256_cmpeq_epi8(hi, _mm256_shuffle_epi8(ws_table, hi)));
+    m.op = movemask64(_mm256_cmpeq_epi8(_mm256_or_si256(lo, lower), _mm256_shuffle_epi8(op_table, lo)),
+                      _mm256_cmpeq_epi8(_mm256_or_si256(hi, lower), _mm256_shuffle_epi8(op_table, hi)));
+    m.quote = movemask64(_mm256_cmpeq_epi8(lo, quote), _mm256_cmpeq_epi8(hi, quote));
+    m.backslash = movemask64(_mm256_cmpeq_epi8(lo, backslash), _mm256_cmpeq_epi8(hi, backslash));
+    return m;
+}
+
+PQL_TARGET_AVX2 inline uint64_t prefix_xor_clmul(uint64_t x) {
+    // Carry-less multiply by all ones computes the running XOR in one instruction.
+    const __m128i all_ones = _mm_set1_epi8(static_cast<char>(0xFF));
+    const __m128i r = _mm_clmulepi64_si128(_mm_set_epi64x(0, static_cast<int64_t>(x)), all_ones, 0);
+    return static_cast<uint64_t>(_mm_cvtsi128_si64(r));
+}
+
+PQL_TARGET_AVX2 inline uint32_t* process_block_avx2(const uint8_t* p, uint32_t base, uint32_t* out, Stage1State& s) {
+    const BlockMasks m = classify_avx2(p);
+    const uint64_t quote = m.quote & ~escaped_bits(m.backslash, s);
+    const uint64_t in_string = prefix_xor_clmul(quote) ^ s.prev_in_string;
+    s.prev_in_string = static_cast<uint64_t>(static_cast<int64_t>(in_string) >> 63);
+    return flatten_bits(out, base, structural_bits(m, quote, in_string, s));
+}
+
+PQL_TARGET_AVX2 uint32_t* stage1_avx2(const uint8_t* data, size_t len, uint32_t* out, Stage1State& s) {
+    size_t i = 0;
+    for (; i + BLOCK <= len; i += BLOCK) {
+        out = process_block_avx2(data + i, static_cast<uint32_t>(i), out, s);
+    }
+    if (i < len) {
+        alignas(32) uint8_t tail[BLOCK];
+        std::memset(tail, ' ', BLOCK);
+        std::memcpy(tail, data + i, len - i);
+        out = process_block_avx2(tail, static_cast<uint32_t>(i), out, s);
+    }
+    return out;
 }
 
 #endif
 
-} // namespace avx2
-
-// ============================================================================
-// JSON Parser Implementation
-// ============================================================================
-
-void JsonDocument::Parser::skip_whitespace() {
-    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {
-        ++pos;
+uint32_t* stage1_scalar(const uint8_t* data, size_t len, uint32_t* out, Stage1State& s) {
+    size_t i = 0;
+    for (; i + BLOCK <= len; i += BLOCK) {
+        out = process_block_scalar(data + i, static_cast<uint32_t>(i), out, s);
     }
+    if (i < len) {
+        uint8_t tail[BLOCK];
+        std::memset(tail, ' ', BLOCK);
+        std::memcpy(tail, data + i, len - i);
+        out = process_block_scalar(tail, static_cast<uint32_t>(i), out, s);
+    }
+    return out;
 }
 
-void JsonDocument::Parser::expect(char c) {
-    if (peek() != c) {
-        throw JsonParseError(std::string("Expected '") + c + "'", pos);
-    }
-    advance();
-}
-
-bool JsonDocument::Parser::match(std::string_view str) {
-    if (json.substr(pos, str.size()) == str) {
-        pos += str.size();
-        return true;
-    }
+bool simd_available() {
+#if defined(PQL_X86_64)
+    const DIA arch = active_arch();
+    return arch == DIA::AVX2 || arch == DIA::AVX512;
+#else
     return false;
+#endif
 }
 
-JsonValue JsonDocument::Parser::parse_null() {
-    if (!match("null")) {
-        throw JsonParseError("Expected 'null'", pos);
-    }
-    return JsonValue(nullptr);
-}
+// Index buffer reused across parses on the same thread, so parsing a stream of
+// small messages does not allocate it every time.
+struct IndexBuffer {
+    std::unique_ptr<uint32_t[]> data;
+    size_t capacity = 0;
 
-JsonValue JsonDocument::Parser::parse_bool() {
-    if (match("true")) {
-        return JsonValue(true);
-    }
-    if (match("false")) {
-        return JsonValue(false);
-    }
-    throw JsonParseError("Expected boolean", pos);
-}
-
-JsonValue JsonDocument::Parser::parse_number() {
-    size_t start = pos;
-
-    // Handle negative sign
-    if (peek() == '-') {
-        advance();
-    }
-
-    // Parse integer part
-    if (peek() == '0') {
-        advance();
-    } else if (peek() >= '1' && peek() <= '9') {
-        while (peek() >= '0' && peek() <= '9') {
-            advance();
+    uint32_t* reserve(size_t n) {
+        if (n > capacity) {
+            data = std::make_unique_for_overwrite<uint32_t[]>(n);
+            capacity = n;
         }
+        return data.get();
+    }
+
+    void trim() {
+        constexpr size_t keep = size_t(1) << 20; // 4 MB
+        if (capacity > keep) {
+            data.reset();
+            capacity = 0;
+        }
+    }
+};
+
+// Returns the number of indexes written to `buf`.
+size_t run_stage1(std::string_view json, IndexBuffer& buf, bool use_simd) {
+    if (json.size() > std::numeric_limits<uint32_t>::max() - BLOCK) {
+        throw JsonParseError("Document too large (max 4 GB)", 0);
+    }
+    // At most one index per byte, plus slack for the unconditional writes in flatten_bits.
+    uint32_t* out = buf.reserve(json.size() + BLOCK);
+    const auto* data = reinterpret_cast<const uint8_t*>(json.data());
+    Stage1State state;
+
+    uint32_t* end;
+#if defined(PQL_X86_64)
+    if (use_simd && simd_available()) {
+        end = stage1_avx2(data, json.size(), out, state);
     } else {
-        throw JsonParseError("Invalid number", pos);
+        end = stage1_scalar(data, json.size(), out, state);
     }
+#else
+    (void)use_simd;
+    end = stage1_scalar(data, json.size(), out, state);
+#endif
 
-    // Parse fractional part
-    if (peek() == '.') {
-        advance();
-        if (peek() < '0' || peek() > '9') {
-            throw JsonParseError("Expected digit after decimal point", pos);
-        }
-        while (peek() >= '0' && peek() <= '9') {
-            advance();
-        }
+    if (state.prev_in_string) {
+        throw JsonParseError("Unterminated string", json.size());
     }
-
-    // Parse exponent
-    if (peek() == 'e' || peek() == 'E') {
-        advance();
-        if (peek() == '+' || peek() == '-') {
-            advance();
-        }
-        if (peek() < '0' || peek() > '9') {
-            throw JsonParseError("Expected digit in exponent", pos);
-        }
-        while (peek() >= '0' && peek() <= '9') {
-            advance();
-        }
-    }
-
-    // Convert to double
-    std::string_view num_str = json.substr(start, pos - start);
-    double value = 0.0;
-
-    auto result = std::from_chars(num_str.data(), num_str.data() + num_str.size(), value);
-    if (result.ec != std::errc()) {
-        throw JsonParseError("Invalid number format", start);
-    }
-
-    return JsonValue(value);
+    return static_cast<size_t>(end - out);
 }
 
-JsonValue JsonDocument::Parser::parse_string() {
-    expect('"');
+thread_local IndexBuffer t_index_buffer;
 
-    std::string result;
-    result.reserve(32); // Reserve some space
+// Builds JsonValue trees for JsonDocument::parse.
+struct JsonValueSink {
+    using Value = JsonValue;
+    using Array = JsonValue::Array;
+    using Object = JsonValue::Object;
+    using Key = std::string;
 
-    while (peek() != '"' && peek() != '\0') {
-        if (peek() == '\\') {
-            advance();
-            char escaped = advance();
-            switch (escaped) {
-                case '"':  result += '"';  break;
-                case '\\': result += '\\'; break;
-                case '/':  result += '/';  break;
-                case 'b':  result += '\b'; break;
-                case 'f':  result += '\f'; break;
-                case 'n':  result += '\n'; break;
-                case 'r':  result += '\r'; break;
-                case 't':  result += '\t'; break;
-                case 'u': {
-                    // Unicode escape (simplified - just handle basic case)
-                    char hex[5] = {0};
-                    for (int i = 0; i < 4; ++i) {
-                        hex[i] = advance();
-                        if (!std::isxdigit(static_cast<unsigned char>(hex[i]))) {
-                            throw JsonParseError("Invalid unicode escape", pos - 1);
-                        }
-                    }
-                    // For simplicity, just add placeholder (full Unicode support would be more complex)
-                    result += "\\u";
-                    result += hex;
-                    break;
-                }
-                default:
-                    throw JsonParseError("Invalid escape sequence", pos - 1);
-            }
-        } else {
-            result += advance();
-        }
+    Value make_null() { return JsonValue(nullptr); }
+    Value make_bool(bool b) { return JsonValue(b); }
+    Value make_double(double d) { return JsonValue(d); }
+    Value make_integer(std::string_view text, uint64_t magnitude, bool negative, bool exact) {
+        return JsonValue(json_detail::integer_to_double(text, magnitude, negative, exact));
     }
+    Value make_string(std::string& s) { return JsonValue(std::move(s)); }
+    Key make_key(std::string& s) { return std::move(s); }
 
-    expect('"');
-    return JsonValue(std::move(result));
+    Array new_array() { return {}; }
+    void push(Array& a, Value&& v) { a.push_back(std::move(v)); }
+    Value finish(Array&& a) { return JsonValue(std::move(a)); }
+
+    Object new_object() { return {}; }
+    // Duplicate keys: the last one wins, like Python's json module.
+    void insert(Object& o, Key&& k, Value&& v) { o.insert_or_assign(std::move(k), std::move(v)); }
+    Value finish(Object&& o) { return JsonValue(std::move(o)); }
+};
+
+} // namespace
+
+json_detail::IndexView json_detail::index_document(std::string_view json) {
+    const size_t count = run_stage1(json, t_index_buffer, true);
+    return {t_index_buffer.data.get(), count};
 }
 
-JsonValue JsonDocument::Parser::parse_array() {
-    expect('[');
-    skip_whitespace();
-
-    JsonValue::Array arr;
-
-    if (peek() == ']') {
-        advance();
-        return JsonValue(std::move(arr));
-    }
-
-    while (true) {
-        skip_whitespace();
-        arr.push_back(parse_value());
-        skip_whitespace();
-
-        if (peek() == ',') {
-            advance();
-            skip_whitespace();
-        } else if (peek() == ']') {
-            advance();
-            break;
-        } else {
-            throw JsonParseError("Expected ',' or ']' in array", pos);
-        }
-    }
-
-    return JsonValue(std::move(arr));
+void json_detail::release_index_buffer() {
+    t_index_buffer.trim();
 }
 
-JsonValue JsonDocument::Parser::parse_object() {
-    expect('{');
-    skip_whitespace();
-
-    JsonValue::Object obj;
-
-    if (peek() == '}') {
-        advance();
-        return JsonValue(std::move(obj));
-    }
-
-    while (true) {
-        skip_whitespace();
-
-        // Parse key
-        if (peek() != '"') {
-            throw JsonParseError("Expected string key in object", pos);
-        }
-        JsonValue key_val = parse_string();
-        std::string key = key_val.as_string();
-
-        skip_whitespace();
-        expect(':');
-        skip_whitespace();
-
-        // Parse value
-        JsonValue value = parse_value();
-        obj[key] = std::move(value);
-
-        skip_whitespace();
-
-        if (peek() == ',') {
-            advance();
-            skip_whitespace();
-        } else if (peek() == '}') {
-            advance();
-            break;
-        } else {
-            throw JsonParseError("Expected ',' or '}' in object", pos);
-        }
-    }
-
-    return JsonValue(std::move(obj));
-}
-
-JsonValue JsonDocument::Parser::parse_value() {
-    skip_whitespace();
-
-    char c = peek();
-
-    switch (c) {
-        case 'n':
-            return parse_null();
-        case 't':
-        case 'f':
-            return parse_bool();
-        case '"':
-            return parse_string();
-        case '[':
-            return parse_array();
-        case '{':
-            return parse_object();
-        case '-':
-        case '0': case '1': case '2': case '3': case '4':
-        case '5': case '6': case '7': case '8': case '9':
-            return parse_number();
-        default:
-            throw JsonParseError("Unexpected character", pos);
-    }
+void json_detail::find_structural_indexes(std::string_view json, std::vector<uint32_t>& out, bool use_simd) {
+    IndexBuffer buf;
+    const size_t n = run_stage1(json, buf, use_simd);
+    out.assign(buf.data.get(), buf.data.get() + n);
 }
 
 JsonDocument JsonDocument::parse(std::string_view json) {
+    struct Release {
+        ~Release() { json_detail::release_index_buffer(); }
+    } release;
+
+    JsonValueSink sink;
     JsonDocument doc;
-    Parser parser(json);
-
-    parser.skip_whitespace();
-    if (parser.pos >= json.size()) {
-        throw JsonParseError("Empty document", 0);
-    }
-
-    doc.root_ = parser.parse_value();
-
-    parser.skip_whitespace();
-    if (parser.pos < json.size()) {
-        throw JsonParseError("Unexpected data after JSON value", parser.pos);
-    }
-
-    if (doc.root_.is_null()) {
-        doc.explicit_null_ = true;
-    }
-
+    doc.root_ = json_detail::TapeWalker<JsonValueSink>(json, json_detail::index_document(json), sink).parse_document();
+    doc.explicit_null_ = doc.root_.is_null();
     return doc;
 }

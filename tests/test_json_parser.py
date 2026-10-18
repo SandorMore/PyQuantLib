@@ -10,7 +10,9 @@ if hasattr(os, 'add_dll_directory'):
     os.add_dll_directory(build_dir)
     os.add_dll_directory("C:/vcpkg/installed/x64-windows/bin")
 
-from PyQuantLib import JsonDocument, JsonParseError, init_parser, get_simd_arch, simd_arch_to_string
+import json
+
+from PyQuantLib import JsonDocument, JsonParseError, loads, init_parser, get_simd_arch, simd_arch_to_string
 
 def test_simple_values():
     """Test parsing simple JSON values"""
@@ -186,6 +188,48 @@ def test_whitespace_handling():
     assert doc.root().as_object()["key"].as_string() == "value"
     print("  [OK] whitespace handling")
 
+def test_unicode():
+    """Test unicode escapes and raw UTF-8"""
+    print("\nTesting unicode...")
+
+    doc = JsonDocument.parse(r'"caf\u00e9 \ud83d\ude00"')
+    assert doc.root().as_string() == "caf\u00e9 \U0001F600"
+    print("  [OK] \\u escapes and surrogate pairs")
+
+    doc = JsonDocument.parse('"z\u00fcrich \u20ac"')
+    assert doc.root().as_string() == "z\u00fcrich \u20ac"
+    print("  [OK] raw UTF-8")
+
+def test_loads():
+    """Test loads() against the standard library json module"""
+    print("\nTesting loads...")
+
+    samples = [
+        '{"e":"trade","s":"BTCUSDT","p":"67123.45","q":"0.0123","T":1729250000123,"m":true}',
+        '[1, -2, 3.5, 1e3, 12345678901234567890123, -9223372036854775808, null, false]',
+        '{"nested": {"list": [[], {}, [{"a": "\\"quoted\\""}]]}, "dup": 1, "dup": 2}',
+        '"' + "x" * 200 + '\\n' + "y" * 100 + '"',
+    ]
+    for sample in samples:
+        assert loads(sample) == json.loads(sample), sample
+        assert loads(sample.encode()) == json.loads(sample), sample
+    assert type(loads("42")) is int
+    assert type(loads("42.0")) is float
+    print("  [OK] matches json.loads (str and bytes)")
+
+    for bad in ['', '[1,]', '{"a" 1}', '"unterminated', '[1 2]', 'nul', '01', '"\x01"', '[' * 2000]:
+        try:
+            loads(bad)
+            print(f"  [FAIL] {bad[:20]!r} (should have failed)")
+        except JsonParseError:
+            pass
+    assert issubclass(JsonParseError, ValueError)
+    print("  [OK] invalid documents raise JsonParseError")
+
+    root = JsonDocument.parse('{"a": [1, "two", null]}').root()
+    assert root.to_python() == {"a": [1.0, "two", None]}
+    print("  [OK] JsonValue.to_python")
+
 def main():
     print("=" * 60)
     print("SIMD JSON Parser Test Suite")
@@ -205,6 +249,8 @@ def main():
     test_complex_json()
     test_error_handling()
     test_whitespace_handling()
+    test_unicode()
+    test_loads()
 
     print("\n" + "=" * 60)
     print("All tests completed!")
