@@ -1,0 +1,44 @@
+name: Build, test, promote to release
+
+on:
+  push:
+    branches: [unstable]
+
+# Don't let two promotions race each other
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  promote:
+    needs: build-and-test         
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       
+
+      - name: Merge unstable into release
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout release
+          git merge --ff-only ${{ github.sha }}
+          git push origin release
