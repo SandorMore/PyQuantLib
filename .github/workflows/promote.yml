@@ -23,27 +23,19 @@ jobs:
         with:
           cmake-version: '4.1.x'
 
-      - name: Set up vcpkg
+      - name: Install dependencies
         run: |
-          git clone https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
-          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
-          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
-
-      - name: Cache vcpkg packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libboost-dev libssl-dev
 
       - name: Configure
         run: >
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --preset default
           -DCMAKE_CXX_COMPILER=g++-14
-          -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
           -DPython_EXECUTABLE=$(which python)
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build --preset default --parallel
 
       - name: Test
         run: |

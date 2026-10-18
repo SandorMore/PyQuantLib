@@ -4,12 +4,15 @@
     {
       "name": "default",
       "binaryDir": "${sourceDir}/build",
-      "generator": "Ninja",
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "C:/vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "CMAKE_BUILD_TYPE": "Release",
-        "Python_EXECUTABLE": "C:/Program Files/Python312/python.exe"
+        "CMAKE_BUILD_TYPE": "Release"
       }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
     }
   ]
 }
