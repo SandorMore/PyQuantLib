@@ -12,7 +12,7 @@ using namespace boost::beast::websocket;
 class WS_Connection final 
 {
 public:
-    asio::awaitable<void> ws_client(std::string host, std::string port, std::string target, std::string subscirbe_msg);
+
     
 private:
 };

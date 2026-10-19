@@ -5,6 +5,7 @@
 #include "TSQueue/TSQueue.hpp"
 #include "Parser/Parser.hpp"
 #include "Parser/JsonTape.hpp"
+#include "OrderBook/OrderBook.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -203,6 +204,68 @@ PYBIND11_MODULE(PyQuantLib, module)
 
     module.def("loads", &json_loads, py::arg("data"),
                "Parse str or bytes straight into Python objects, like json.loads");
+
+    // Order Book
+    py::enum_<Side>(module, "Side")
+        .value("Buy", Side::Buy)
+        .value("Sell", Side::Sell);
+
+    py::enum_<OrderType>(module, "OrderType")
+        .value("Limit", OrderType::Limit)
+        .value("Market", OrderType::Market);
+
+    py::enum_<TimeInForce>(module, "TimeInForce")
+        .value("GTC", TimeInForce::GoodTillCancel)
+        .value("IOC", TimeInForce::ImmediateOrCancel)
+        .value("FOK", TimeInForce::FillOrKill);
+
+    py::enum_<OrderStatus>(module, "OrderStatus")
+        .value("New", OrderStatus::New)
+        .value("PartiallyFilled", OrderStatus::PartiallyFilled)
+        .value("Filled", OrderStatus::Filled)
+        .value("Cancelled", OrderStatus::Cancelled)
+        .value("Rejected", OrderStatus::Rejected);
+
+    py::class_<OrderBook::ExecReport>(module, "ExecReport")
+        .def_readonly("id", &OrderBook::ExecReport::id)
+        .def_readonly("status", &OrderBook::ExecReport::status)
+        .def_readonly("filled", &OrderBook::ExecReport::filled)
+        .def_readonly("remaining", &OrderBook::ExecReport::remaining);
+
+    py::class_<OrderBook::Trade>(module, "Trade")
+        .def_readonly("maker", &OrderBook::Trade::maker)
+        .def_readonly("taker", &OrderBook::Trade::taker)
+        .def_readonly("price", &OrderBook::Trade::price)
+        .def_readonly("qty", &OrderBook::Trade::qty)
+        .def_readonly("taker_side", &OrderBook::Trade::takerSide);
+
+    py::class_<OrderBook>(module, "OrderBook")
+        .def(py::init<std::uint32_t, std::size_t>(), py::arg("max_orders"), py::arg("expected_levels") = 4096)
+        .def("submit", &OrderBook::submit, py::arg("side"), py::arg("type"), py::arg("tif"),
+             py::arg("price"), py::arg("qty"), py::call_guard<py::gil_scoped_release>())
+        .def("cancel", &OrderBook::cancel, py::arg("id"))
+        .def("reduce", &OrderBook::reduce, py::arg("id"), py::arg("new_qty"))
+        .def("replace", &OrderBook::replace, py::arg("id"), py::arg("price"), py::arg("qty"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("trades", [](const OrderBook& ob) {
+            const auto t = ob.trades();
+            return std::vector<OrderBook::Trade>(t.begin(), t.end());
+        }, "Trades from the last submit/replace")
+        .def("best_bid", &OrderBook::bestBid)
+        .def("best_ask", &OrderBook::bestAsk)
+        .def("volume_at", &OrderBook::volumeAt, py::arg("side"), py::arg("price"))
+        .def("depth", [](const OrderBook& ob, Side side, std::size_t levels) {
+            py::list out;
+            for (const auto& l : ob.depth(side, levels)) out.append(py::make_tuple(l.price, l.qty));
+            return out;
+        }, py::arg("side"), py::arg("levels"), "List of (price, qty), best first")
+        .def("find", [](const OrderBook& ob, OrderId id) -> py::object {
+            const auto o = ob.find(id);
+            if (!o) return py::none();
+            return py::make_tuple(o->id, o->side, o->price, o->qty);
+        }, py::arg("id"), "(id, side, price, qty) or None")
+        .def("order_count", &OrderBook::orderCount)
+        .def("level_count", &OrderBook::levelCount, py::arg("side"));
 
     // Initialize SIMD architecture detection
     module.def("init_parser", &init, "Initialize the JSON parser");

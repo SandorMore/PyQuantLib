@@ -24,6 +24,7 @@ find_package(Boost 1.83 REQUIRED CONFIG)
 pybind11_add_module(PyQuantLib
     src/main.cpp
     src/Parser/Parser.cpp
+    src/OrderBook/OrderBook.cpp
 )
 
 target_link_libraries(PyQuantLib PRIVATE
